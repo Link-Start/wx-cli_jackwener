@@ -531,17 +531,17 @@ fn query_messages(
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
         let content = decompress_message(&content_bytes, ct);
         let sender = sender_label(real_sender_id, &content, is_group, chat_username, &id2u, names_map);
-        let message = message_meta(local_id, local_type, &content, is_group);
-
-        result.push(json!({
+        let MessageMeta { content, url } = message_meta(local_id, local_type, &content, is_group);
+        let mut row = json!({
             "timestamp": ts,
             "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
             "sender": sender,
-            "content": message.content,
-            "url": message.url,
+            "content": content,
             "type": fmt_type(local_type),
             "local_id": local_id,
-        }));
+        });
+        insert_optional_url(&mut row, url);
+        result.push(row);
     }
     Ok(result)
 }
@@ -603,17 +603,17 @@ fn search_in_table(
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
         let content = decompress_message(&content_bytes, ct);
         let sender = sender_label(real_sender_id, &content, is_group, chat_username, &id2u, names_map);
-        let message = message_meta(local_id, local_type, &content, is_group);
-
-        result.push(json!({
+        let MessageMeta { content, url } = message_meta(local_id, local_type, &content, is_group);
+        let mut row = json!({
             "timestamp": ts,
             "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
             "chat": "",
             "sender": sender,
-            "content": message.content,
-            "url": message.url,
+            "content": content,
             "type": fmt_type(local_type),
-        }));
+        });
+        insert_optional_url(&mut row, url);
+        result.push(row);
     }
     Ok(result)
 }
@@ -790,7 +790,7 @@ fn parse_appmsg_meta(text: &str) -> Option<AppMsgMeta> {
         title: clean_xml_text(&extract_xml_text(text, "title")?),
         app_type: clean_xml_text(&extract_xml_text(text, "type").unwrap_or_default()),
         url: extract_xml_text(text, "url").and_then(|url| {
-            let url = clean_xml_text(&url);
+            let url = unescape_html(&clean_xml_text(&url));
             if url.is_empty() { None } else { Some(url) }
         }),
     })
@@ -863,9 +863,16 @@ fn clean_xml_text(s: &str) -> String {
     }
 }
 
+fn insert_optional_url(row: &mut Value, url: Option<String>) {
+    if let (Some(obj), Some(url)) = (row.as_object_mut(), url) {
+        obj.insert("url".into(), Value::String(url));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{message_meta, parse_appmsg, parse_appmsg_meta};
+    use super::{insert_optional_url, message_meta, parse_appmsg, parse_appmsg_meta};
+    use serde_json::json;
 
     #[test]
     fn extracts_url_from_link_appmsg() {
@@ -903,6 +910,27 @@ mod tests {
         let message = message_meta(42, 49, content, true);
         assert_eq!(message.content, "[链接] 群文章");
         assert_eq!(message.url.as_deref(), Some("https://mp.weixin.qq.com/s/group"));
+    }
+
+    #[test]
+    fn unescapes_html_entities_in_url() {
+        let xml = r#"<appmsg><title>测试文章</title><type>5</type><url><![CDATA[https://mp.weixin.qq.com/s/test?a=1&amp;b=2]]></url></appmsg>"#;
+        let meta = parse_appmsg_meta(xml).expect("should parse appmsg meta");
+        assert_eq!(meta.url.as_deref(), Some("https://mp.weixin.qq.com/s/test?a=1&b=2"));
+    }
+
+    #[test]
+    fn omits_url_field_when_absent() {
+        let mut row = json!({ "content": "hello" });
+        insert_optional_url(&mut row, None);
+        assert!(row.get("url").is_none());
+    }
+
+    #[test]
+    fn inserts_url_field_when_present() {
+        let mut row = json!({ "content": "hello" });
+        insert_optional_url(&mut row, Some("https://example.com".into()));
+        assert_eq!(row.get("url").and_then(|v| v.as_str()), Some("https://example.com"));
     }
 }
 
@@ -1279,8 +1307,8 @@ pub async fn q_new_messages(
                 for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
                     let content = decompress_message(&content_bytes, ct);
                     let sender = sender_label(real_sender_id, &content, is_group, &uname2, &id2u, &names_map);
-                    let message = message_meta(local_id, local_type, &content, is_group);
-                    result.push(json!({
+                    let MessageMeta { content, url } = message_meta(local_id, local_type, &content, is_group);
+                    let mut row = json!({
                         "chat": display2,
                         "username": uname2,
                         "is_group": is_group,
@@ -1288,10 +1316,11 @@ pub async fn q_new_messages(
                         "timestamp": ts,
                         "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
                         "sender": sender,
-                        "content": message.content,
-                        "url": message.url,
+                        "content": content,
                         "type": fmt_type(local_type),
-                    }));
+                    });
+                    insert_optional_url(&mut row, url);
+                    result.push(row);
                 }
                 Ok::<_, anyhow::Error>(result)
             }).await {
@@ -1595,4 +1624,3 @@ pub async fn q_stats(
         "by_hour": by_hour,
     }))
 }
-
